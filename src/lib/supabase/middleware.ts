@@ -41,9 +41,15 @@ export async function updateSession(request: NextRequest) {
   }
 
   const pathname = request.nextUrl.pathname
-  const isAuthRoute = pathname.startsWith('/login')
+  const isAuthRoute = pathname.startsWith('/login') || pathname.startsWith('/auth')
 
-  if (!user && !isAuthRoute) {
+  // Magic Link auto-recovery for missing Supabase UI whitelists
+  const code = request.nextUrl.searchParams.get('code')
+  if (code && !pathname.startsWith('/auth/confirm')) {
+    const url = request.nextUrl.clone()
+    url.pathname = '/auth/confirm'
+    return NextResponse.redirect(url)
+  }  if (!user && !isAuthRoute) {
     // Redirect unauthenticated users to login page
     const url = request.nextUrl.clone()
     url.pathname = '/login'

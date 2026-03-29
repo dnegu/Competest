@@ -4,18 +4,25 @@ import { createClient } from '@/lib/supabase/server'
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url)
+  const code = searchParams.get('code')
   const token_hash = searchParams.get('token_hash')
   const type = searchParams.get('type') as EmailOtpType | null
   const next = searchParams.get('next') ?? '/dashboard'
 
-  if (token_hash && type) {
+  if (code) {
+    // PKCE flow (default in new Supabase projects)
     const supabase = await createClient()
-
-    const { error } = await supabase.auth.verifyOtp({
-      type,
-      token_hash,
-    })
-    
+    const { error } = await supabase.auth.exchangeCodeForSession(code)
+    if (!error) {
+      const nextUrl = request.nextUrl.clone()
+      nextUrl.pathname = next
+      nextUrl.searchParams.delete('code')
+      return NextResponse.redirect(nextUrl)
+    }
+  } else if (token_hash && type) {
+    // Legacy Implicit flow
+    const supabase = await createClient()
+    const { error } = await supabase.auth.verifyOtp({ type, token_hash })
     if (!error) {
       const nextUrl = request.nextUrl.clone()
       nextUrl.pathname = next

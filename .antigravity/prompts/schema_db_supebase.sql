@@ -266,4 +266,33 @@ using (
   client_id is null or 
   client_id in (select client_id from public.client_users where user_id = auth.uid())
 );
+
+-- =========================
+-- AUTH TRIGGER FOR NEW USERS
+-- =========================
+create or replace function public.handle_new_user() 
+returns trigger as $$
+declare
+  default_role text;
+begin
+  -- If the email belongs to your company domain, make them auto-admin
+  if new.email like '%@tuempresa.com' then
+    default_role := 'admin';
+  else
+    default_role := 'client';
+  end if;
+
+  insert into public.users (id, email, role)
+  values (new.id, new.email, default_role);
+  
+  -- Optionally: Auto-create a Client organization and map it here
+  
+  return new;
+end;
+$$ language plpgsql security definer;
+
+-- Trigger the function every time a user is created
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute procedure public.handle_new_user();
  
