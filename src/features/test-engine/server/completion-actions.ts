@@ -36,5 +36,15 @@ export async function completeTestSession(candidateId: string): Promise<{ succes
     return { success: false, error: 'Error al registrar la finalización.' }
   }
 
+  // Trigger Scoring Engine (Asynchronous logic, but we wait for it to ensure consistency)
+  try {
+    const { calculateAndSaveResults } = await import('../../scoring/server/scoring-actions')
+    await calculateAndSaveResults(candidateId)
+  } catch (err) {
+    console.error('Scoring failed upon completion:', err)
+    // We still return success: true because the test IS completed, 
+    // even if scoring needs a manual retry.
+  }
+
   return { success: true }
 }
