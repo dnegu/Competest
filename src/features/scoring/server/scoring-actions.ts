@@ -6,12 +6,11 @@ import { RawResponse, ScoringDimension, ScoringCompetency } from '../types'
 
 /**
  * Recalculates and persists scores for a candidate.
- * Usually called when the test is marked as 'completed'.
  */
 export async function calculateAndSaveResults(candidateId: string) {
   const supabase = createServiceClient()
 
-  // 1. Fetch Candidate & Test Context
+  // 1. Fetch Candidate & Test Context (Removed 'gender' column as it doesn't exist)
   const { data: candidate, error: candError } = await supabase
     .from('candidates')
     .select(`
@@ -37,7 +36,13 @@ export async function calculateAndSaveResults(candidateId: string) {
     .single()
 
   if (candError || !candidate) {
-    throw new Error('Candidate or test context not found')
+    console.error(`Error fetching candidate ${candidateId}:`, candError)
+    return {
+      success: false,
+      error: candError
+        ? `Database Error: ${candError.message} (Code: ${candError.code})`
+        : 'Candidate record not found in database'
+    }
   }
 
   // 2. Fetch Responses
@@ -50,8 +55,9 @@ export async function calculateAndSaveResults(candidateId: string) {
     `)
     .eq('candidate_id', candidateId)
 
-  if (respError || !responses) {
-    throw new Error('No responses found for candidate')
+  if (respError || !responses || responses.length === 0) {
+    console.warn(`No responses for candidate ${candidateId}`)
+    return { success: false, error: 'No responses found' }
   }
 
   // 3. Fetch Competency Mapping
@@ -60,13 +66,17 @@ export async function calculateAndSaveResults(candidateId: string) {
     .select(`
       dimension_id,
       weight,
-      competencies ( id, name )
+      competencies (
+        id, name,
+        inter_alejado, inter_cercano, inter_adecuado,
+        profile_alejado, profile_cercano, profile_adecuado,
+        empathy, areas_for_improvement
+      )
     `)
 
   if (compError) throw compError
 
   // 4. Transform and Run Scoring
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const raw = candidate as any
   const process = raw.processes
   const combo = process?.combos
@@ -74,7 +84,15 @@ export async function calculateAndSaveResults(candidateId: string) {
     ? combo.combo_tests.map((ct: any) => ct.tests) 
     : [combo?.combo_tests?.tests].filter(Boolean)
 
-  // Map database structures to Scoring Engine inputs
+  if (!tests || tests.length === 0) {
+    return { success: false, error: 'No tests associated' }
+  }
+
+  // Detect Gender from responses (In BIG FIVE, it's usually question order_index 0)
+  const genderResponse = responses.find(r => r.questions?.order_index === 0);
+  const genderValue = genderResponse ? (Number(genderResponse.value) === 1 ? 1 : 0) : 0;
+  // 0 = Masculino, 1 = Femenino
+
   const allResults = tests.map((test: any) => {
     const testResponses: RawResponse[] = responses
       .filter((r: any) => r.questions?.test_id === test.id)
@@ -84,17 +102,15 @@ export async function calculateAndSaveResults(candidateId: string) {
         value: Number(r.value)
       }))
 
+    if (testResponses.length === 0) return null;
+
     const testDimensions: ScoringDimension[] = (test.dimensions || []).map((d: any) => ({
       id: d.id,
       name: d.name,
       code: d.code,
-      formula: d.scoring_formulas?.[0]?.formula, // BIGFIVE uses 1 formula per dimension
-      min_score: 12, // TODO: Pull these from interpreting metadata later
-      max_score: 60
+      formula: d.scoring_formulas?.[0]?.formula
     }))
 
-    // Collect competencies that use these dimensions
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const relevantCompIds = new Set<string>(
       compMaps
         .filter((m: any) => testDimensions.some(td => td.id === m.dimension_id))
@@ -118,6 +134,14 @@ export async function calculateAndSaveResults(candidateId: string) {
       return {
         id: cid,
         name: firstComp?.name || 'Unknown',
+        inter_adecuado: firstComp?.inter_adecuado,
+        inter_cercano: firstComp?.inter_cercano,
+        inter_alejado: firstComp?.inter_alejado,
+        profile_adecuado: firstComp?.profile_adecuado,
+        profile_cercano: firstComp?.profile_cercano,
+        profile_alejado: firstComp?.profile_alejado,
+        empathy: firstComp?.empathy,
+        areas_for_improvement: firstComp?.areas_for_improvement,
         dimensions: mapEntries.map((m: any) => ({
           dimension_id: m.dimension_id!,
           weight: Number(m.weight)
@@ -125,12 +149,13 @@ export async function calculateAndSaveResults(candidateId: string) {
       }
     })
 
-    return scoringEngine.process(testResponses, testDimensions, testCompetencies)
-  })
+    return scoringEngine.process(testResponses, testDimensions, testCompetencies, genderValue)
+  }).filter(Boolean)
 
   // 5. Persist Results
   for (const res of allResults) {
-    // Save Dimensions results
+    if (!res) continue;
+
     const dimInserts = res.dimensions.map((d: any) => ({
       candidate_id: candidateId,
       dimension_id: d.dimension_id,
@@ -141,11 +166,13 @@ export async function calculateAndSaveResults(candidateId: string) {
       await supabase.from('results').upsert(dimInserts, { onConflict: 'candidate_id, dimension_id' })
     }
 
-    // Save Competency results
     const compInserts = res.competencies.map((c: any) => ({
       candidate_id: candidateId,
       competency_id: c.competency_id,
-      score: c.score
+      score: c.score,
+      level: c.level,
+      interpretation: c.interpretation,
+      profile: c.profile
     }))
 
     if (compInserts.length > 0) {
@@ -156,3 +183,32 @@ export async function calculateAndSaveResults(candidateId: string) {
   return { success: true }
 }
 
+/**
+ * Recalculates scores for ALL candidates in the database.
+ */
+export async function recalculateAllCandidates() {
+  const supabase = createServiceClient()
+
+  const { data: candidates, error } = await supabase
+    .from('candidates')
+    .select('id')
+
+  if (error) throw error
+
+  const results = []
+  for (const cand of candidates) {
+    try {
+      const res = await calculateAndSaveResults(cand.id)
+      results.push({ id: cand.id, ...res })
+    } catch (e) {
+      results.push({ id: cand.id, success: false, error: String(e) })
+    }
+  }
+
+  return {
+    total: candidates.length,
+    processed: results.length,
+    successes: results.filter(r => r.success).length,
+    failures: results.filter(r => !r.success).length
+  }
+}

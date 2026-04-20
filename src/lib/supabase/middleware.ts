@@ -32,15 +32,19 @@ export async function updateSession(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser()
 
+  const pathname = request.nextUrl.pathname
+  console.log(`[Middleware] Path: ${pathname} | User: ${user?.email}`)
+
   let userRole = null;
   if (user) {
-    const { data: userData } = await supabase.from('users').select('role').eq('id', user.id).single()
+    const { data: userData, error } = await supabase.from('users').select('role').eq('id', user.id).single()
     if (userData) {
       userRole = userData.role
+      console.log(`[Middleware] Role fetched: ${userRole}`)
+    } else {
+      console.log(`[Middleware] Role fetch failed for ${user.id}: ${error?.message}`)
     }
   }
-
-  const pathname = request.nextUrl.pathname
   const isAuthRoute = pathname.startsWith('/login') || pathname.startsWith('/auth')
 
   // Magic Link auto-recovery for missing Supabase UI whitelists

@@ -4,6 +4,18 @@ import { RawResponse, ScoringDimension, ScoringCompetency } from '../types';
 
 describe('Scoring Engine', () => {
   
+  describe('validateFormula', () => {
+    it('should return valid for correct math expressions', () => {
+      expect(scoringEngine.validateFormula("Q1 + Q2 * (36 - Q3)").isValid).toBe(true);
+    });
+
+    it('should return error for invalid syntax', () => {
+      const res = scoringEngine.validateFormula("Q1 + * Q2");
+      expect(res.isValid).toBe(false);
+      expect(res.error).toBeDefined();
+    });
+  });
+
   describe('evaluateFormula', () => {
     it('should correctly evaluate simple addition formula', () => {
       const responses: RawResponse[] = [
@@ -142,6 +154,34 @@ describe('Scoring Engine', () => {
 
       const result = scoringEngine.process(responses, dimensions, competencies);
       expect(result.competencies[0].score).toBe(0);
+    });
+    it('should map scores correctly to interpretation levels', () => {
+      const dimensions: ScoringDimension[] = [{ id: 'd1', name: 'D1', code: 'd1', formula: 'Q1', min_score: 1, max_score: 10 }];
+      const competencies: ScoringCompetency[] = [
+        { 
+          id: 'c1', 
+          name: 'C1', 
+          dimensions: [{ dimension_id: 'd1', weight: 1 }],
+          inter_alejado: 'Low',
+          inter_cercano: 'Mid',
+          inter_adecuado: 'High'
+        }
+      ];
+
+      // Test Alejado (score <= 4.5)
+      const res1 = scoringEngine.process([{ question_id: 'q1', order_index: 1, value: 4 }], dimensions, competencies); // Raw 4, Norm (4-1)/9 * 9 + 1 = 4
+      expect(res1.competencies[0].level).toBe('Alejado');
+      expect(res1.competencies[0].interpretation).toBe('Low');
+
+      // Test Cercano (4.6 <= score <= 7.5)
+      const res2 = scoringEngine.process([{ question_id: 'q1', order_index: 1, value: 6 }], dimensions, competencies); // Raw 6, Norm 6
+      expect(res2.competencies[0].level).toBe('Cercano');
+      expect(res2.competencies[0].interpretation).toBe('Mid');
+
+      // Test Adecuado (score >= 7.6)
+      const res3 = scoringEngine.process([{ question_id: 'q1', order_index: 1, value: 8 }], dimensions, competencies); // Raw 8, Norm 8
+      expect(res3.competencies[0].level).toBe('Adecuado');
+      expect(res3.competencies[0].interpretation).toBe('High');
     });
   });
 });

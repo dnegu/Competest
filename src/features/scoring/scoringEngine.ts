@@ -7,35 +7,43 @@ import {
   CompetencyResult
 } from './types';
 
+import { Parser } from 'expr-eval';
+import { BIG_FIVE_NORMING } from './normingTables';
+
 /**
  * Pure function scoring engine.
- * No side effects, deterministic mathematical logic.
  */
 export const scoringEngine = {
   
   /**
-   * Evaluates a string formula like "36 - (Q1 + Q5) + (Q3)".
-   * Replaces Q{order_index} with the corresponding response value.
+   * Validates if a formula string is syntactically correct.
    */
-  evaluateFormula(formula: string, responses: RawResponse[]): number {
-    // Replace Q{n} with response value where n is the order_index
-    let expression = formula;
-    
-    // Sort responses by order_index descending to avoid partial replacement (e.g., Q10 replaced by Q1)
-    const sorted = [...responses].sort((a, b) => b.order_index - a.order_index);
-    
-    sorted.forEach(r => {
-      const regex = new RegExp(`Q${r.order_index}\\b`, 'g');
-      expression = expression.replace(regex, r.value.toString());
-    });
-
-    // Simple expression evaluation (safer than eval if we only have numbers and basic math)
-    // For now, using Function constructor for simplicity, but strictly limited to math.
+  validateFormula(formula: string): { isValid: boolean; error?: string } {
     try {
-      // Remove any non-math characters for security
-      const sanitized = expression.replace(/[^0-9+\-*/().\s]/g, '');
-      // eslint-disable-next-line no-new-func
-      return new Function(`return ${sanitized}`)();
+      Parser.parse(formula);
+      return { isValid: true };
+    } catch (e: any) {
+      return { isValid: false, error: e.message };
+    }
+  },
+
+  /**
+   * Evaluates a string formula like "36 - (Q1 + Q5) + (Q3)" or "D1 + D2".
+   * Uses expr-eval for safe, non-eval execution.
+   */
+  evaluateFormula(formula: string, responses: RawResponse[], dimensionValues: Record<string, number> = {}): number {
+    try {
+      const parser = new Parser();
+      const expr = parser.parse(formula);
+      
+      // Map variables (Q1, Q2...) to their numeric values
+      const variables: Record<string, number> = { ...dimensionValues };
+      responses.forEach(r => {
+        variables[`Q${r.order_index}`] = r.value;
+      });
+
+      // Execute with variables
+      return expr.evaluate(variables);
     } catch (e) {
       console.error(`Error evaluating formula: ${formula}`, e);
       return 0;
@@ -43,26 +51,34 @@ export const scoringEngine = {
   },
 
   /**
-   * Normalizes a raw score to a standard 1-10 scale using Min-Max scaling.
-   * 
-   * Formula: ((raw - min) / (max - min)) * 9 + 1
-   * 
-   * Features:
-   * - Prevents division by zero (returns median 5.5 if max === min).
-   * - Clamps output strictly between 1.00 and 10.00.
-   * - Deterministic rounding (2 decimal places).
+   * Applies norming tables to a raw score.
    */
-  normalize(raw: number, min: number, max: number): number {
-    if (max === min) return 5.5; // Neutral midpoint fallback
+  norm(raw: number, type: 'subdimension' | 'dimension', index: number, gender: 0 | 1): number {
+    const tableSet = type === 'subdimension' ? BIG_FIVE_NORMING.subdimensions : BIG_FIVE_NORMING.dimensions;
+    const tableIndex = (index * 2) + gender;
+    const table = tableSet[tableIndex];
+
+    if (!table) return raw;
+
+    const offset = type === 'subdimension' ? 12 : 24;
+    const lookupIndex = Math.max(0, Math.min(Math.round(raw) - offset, table.length - 1));
     
-    // Scale to [0, 1]
-    const clampedRaw = Math.min(Math.max(raw, min), max);
-    const scaled = (clampedRaw - min) / (max - min);
-    
-    // Transform to [1, 10]
-    const norm = (scaled * 9) + 1;
-    
-    return Number(norm.toFixed(2));
+    return table[lookupIndex];
+  },
+
+  /**
+   * Normalizes a normed score (usually 20-80 range) to 1-10.
+   * BIG FIVE interpreted scores typically range from 27 to 73 in the matrices.
+   */
+  normalize(normed: number): number {
+    // Map 20-80 range (standard T-score-like) to 1-10
+    // Based on BIGFIVE.js: nivel(val) does Math.round(val/10)
+    // Here we want a finer grain 1-10
+    const min = 20;
+    const max = 80;
+    const scaled = (normed - min) / (max - min);
+    const result = (scaled * 9) + 1;
+    return Number(Math.max(1, Math.min(10, result)).toFixed(2));
   },
 
   /**
@@ -71,32 +87,68 @@ export const scoringEngine = {
   process(
     responses: RawResponse[],
     dimensions: ScoringDimension[],
-    competencies: ScoringCompetency[]
+    competencies: ScoringCompetency[],
+    gender: number = 0
   ): ScoringOutput {
-    // 1. Calculate Dimension Scores
-    const dimensionResults: DimensionResult[] = dimensions.map(d => {
-      let rawScore = 0;
-      
-      if (d.formula) {
-        rawScore = this.evaluateFormula(d.formula, responses);
+    const genderIdx = gender === 1 ? 1 : 0;
+    const dimensionResults: DimensionResult[] = [];
+    const calculatedValues: Record<string, number> = {};
+
+    // Helper to calculate a dimension
+    const calculateDim = (d: ScoringDimension) => {
+      // If already calculated, skip
+      if (dimensionResults.find(res => res.dimension_id === d.id)) return;
+
+      const rawScore = d.formula
+        ? this.evaluateFormula(d.formula, responses, calculatedValues)
+        : responses.reduce((acc, r) => acc + r.value, 0);
+
+      // Identify type and table index based on code (D1-D11 are sub, D12-D16 are dim)
+      const codeMatch = d.code?.match(/D(\d+)/);
+      const dNum = codeMatch ? parseInt(codeMatch[1]) : 0;
+
+      let type: 'subdimension' | 'dimension' = 'subdimension';
+      let tableIndex = 0;
+
+      if (dNum >= 1 && dNum <= 11) {
+        type = 'subdimension';
+        tableIndex = dNum - 1;
+      } else if (dNum >= 12 && dNum <= 16) {
+        type = 'dimension';
+        tableIndex = dNum - 12;
       } else {
-        // Simple sum fallback if no formula provided
-        rawScore = responses.reduce((acc, r) => acc + r.value, 0);
+        // Fallback if code doesn't match D1-D16
+        type = 'subdimension';
+        tableIndex = 0;
       }
 
-      // If min/max not provided, assume 1-5 * number of questions in formula or full test
-      const min = d.min_score ?? 12; // Default for BFQ subdimensions usually 12 questions? 
-      const max = d.max_score ?? 60; // Just placeholders if not in DB
+      const normedScore = this.norm(rawScore, type, tableIndex, genderIdx);
+      const normalizedScore = this.normalize(normedScore);
 
-      return {
+      dimensionResults.push({
         dimension_id: d.id,
         name: d.name,
         rawScore,
-        normalizedScore: this.normalize(rawScore, min, max)
-      };
-    });
+        normedScore,
+        normalizedScore
+      });
 
-    // 2. Calculate Competency Scores (Weighted Average of Normalized Dimension Scores)
+      // Store rawScore in the map for future dependencies (using its code D1, D2...)
+      if (d.code) {
+        calculatedValues[d.code] = rawScore;
+      }
+    };
+
+    // Split dimensions into those that use Q (Level 1) and those that use D (Level 2)
+    const level1 = dimensions.filter(d => !d.formula || !d.formula.includes('D'));
+    const level2 = dimensions.filter(d => d.formula?.includes('D'));
+
+    // Process Level 1 first
+    level1.forEach(d => calculateDim(d));
+    // Process Level 2 (now they have access to calculatedValues from Level 1)
+    level2.forEach(d => calculateDim(d));
+
+    // 2. Calculate Competency Scores
     const competencyResults: CompetencyResult[] = competencies.map(c => {
       let totalWeightedScore = 0;
       let totalWeight = 0;
@@ -109,12 +161,37 @@ export const scoringEngine = {
         }
       });
 
-      const score = totalWeight > 0 ? totalWeightedScore / totalWeight : 0;
+      const rawScore = totalWeight > 0 ? totalWeightedScore / totalWeight : 0;
+      const score = Number(rawScore.toFixed(2));
+
+      // 3. Determine Interpretation Level
+      let level: 'Alejado' | 'Cercano' | 'Adecuado' = 'Alejado';
+      let interpretation = '';
+      let profile = '';
+
+      if (score >= 7.6) {
+        level = 'Adecuado';
+        interpretation = c.inter_adecuado || '';
+        profile = c.profile_adecuado || '';
+      } else if (score >= 4.6) {
+        level = 'Cercano';
+        interpretation = c.inter_cercano || '';
+        profile = c.profile_cercano || '';
+      } else {
+        level = 'Alejado';
+        interpretation = c.inter_alejado || '';
+        profile = c.profile_alejado || '';
+      }
 
       return {
         competency_id: c.id,
         name: c.name,
-        score: Number(score.toFixed(2))
+        score,
+        level,
+        interpretation,
+        profile,
+        empathy: c.empathy,
+        areas_for_improvement: c.areas_for_improvement
       };
     });
 
